@@ -29,6 +29,8 @@ import { HorizonHistoryImportModule } from './horizon-history-import/horizon-his
 import { DevelopersModule } from './developers/developers.module';
 import { ProjectsModule } from './projects/projects.module';
 import { HealthModule } from './health/health.module';
+import { IdempotentUserModule } from './users/idempotent-user.module';
+import { TracingModule } from './tracing/tracing.module';
 import { ApiChangelogModule } from './api-changelog/api-changelog.module';
 import { BackupModule } from './backup/backup.module';
 import { SloModule } from './common/slo/slo.module';
@@ -60,6 +62,8 @@ import { LatencySloInterceptor } from './common/slo/latency-slo.interceptor';
     DevelopersModule,
     ProjectsModule,
     HealthModule,
+    IdempotentUserModule,
+    TracingModule,
     ApiChangelogModule,
     BackupModule,
     SloModule,
