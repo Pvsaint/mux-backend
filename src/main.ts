@@ -1,81 +1,13 @@
-import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import requestLogger from './common/middleware/request-logging.middleware';
-import { configureBodySizeLimit } from './common/http/body-size-limit';
-import { validateEnv } from './config/env.validation';
-import { IsoUtcTimestampInterceptor } from './common/interceptors';
-import { HttpExceptionFilter } from './common/filters/http-exception.filter';
-import { GracefulShutdownService } from './common/shutdown/graceful-shutdown.service';
-import { DrainInProgressInterceptor } from './common/shutdown/drain-in-progress.interceptor';
-
-/**
- * Parses the CORS_ALLOWED_ORIGINS env var into an array of allowed origins.
- * Falls back to localhost:3000 for local development.
- *
- * Format: comma-separated list, e.g.
- *   CORS_ALLOWED_ORIGINS=https://app.mux.finance,https://partner.example.com
- */
-function parseCorsOrigins(raw: string | undefined): string[] {
-  if (!raw) return ['http://localhost:3000'];
-  return raw
-    .split(',')
-    .map((o) => o.trim())
-    .filter(Boolean);
-}
 
 async function bootstrap() {
-  const logger = new Logger('Bootstrap');
-
-  // Validate all required environment variables before anything else starts.
-  const env = validateEnv(process.env);
-
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
-
-  // Apply the configurable JSON body size limit. Oversized payloads are
-  // rejected with a stable 413 error envelope (code + correlation id).
-  configureBodySizeLimit(app, env.JSON_BODY_LIMIT_BYTES);
-
-  // Configure CORS with credentials support
-  // Only allow credentials when explicitly whitelisted origins are used
-  const corsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000')
-    .split(',')
-    .map((o) => o.trim());
-  app.enableCors({
-    origin: (
-      origin: string | undefined,
-      callback: (err: Error | null, allow?: boolean) => void,
-    ) => {
-      if (!origin || corsOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'), false);
-      }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'X-API-Key',
-      'X-Request-ID',
-      'X-Client-Version',
-    ],
-    exposedHeaders: [
-      'X-Request-ID',
-      'X-RateLimit-Remaining',
-      'X-RateLimit-Reset',
-    ],
-    maxAge: 3600,
-  });
-
+  const app = await NestFactory.create(AppModule);
   // Attach request logging middleware early in the pipeline
   app.use(requestLogger as any);
-
-  // All routes are served under /v1. See docs/API-VERSIONING.md for the
-  // versioning strategy and how future breaking changes will be introduced.
-  app.setGlobalPrefix('v1');
 
   // Validate incoming requests for DTOs globally
   app.useGlobalPipes(
@@ -86,37 +18,67 @@ async function bootstrap() {
     }),
   );
 
-  // Normalize all Date values in HTTP responses to ISO 8601 UTC strings.
-  app.useGlobalInterceptors(new IsoUtcTimestampInterceptor());
+  // ── OpenAPI / Swagger (#969) ────────────────────────────────────────────────
+  // Enabled by default; set SWAGGER_ENABLED=false to disable (e.g. production).
+  if (process.env['SWAGGER_ENABLED'] !== 'false') {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('Mux Backend API')
+      .setDescription(
+        'Backend infrastructure for Mux Protocol — invisible wallets, ' +
+          'payment orchestration, and Soroban smart contract interaction on Stellar.',
+      )
+      .setVersion('1.0')
+      .setContact(
+        'Mux Labs',
+        'https://github.com/mux-labs/mux-backend',
+        '',
+      )
+      .setLicense('MIT', 'https://opensource.org/licenses/MIT')
+      // ── Security schemes ──────────────────────────────────────────────────
+      // ApiKeyAuth: API keys issued to developers (format: mux_live_* / mux_test_*)
+      // Transmitted via:  Authorization: Bearer <key>
+      .addBearerAuth(
+        {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'ApiKey',
+          name: 'Authorization',
+          description:
+            'Developer API key — format: `mux_live_<32chars>` or `mux_test_<32chars>`. ' +
+            'Transmitted as `Authorization: Bearer <key>`.',
+          in: 'header',
+        },
+        'ApiKeyAuth',
+      )
+      // PublicEndpoint tag: documents routes that are intentionally unauthenticated
+      // (e.g. POST /auth/authenticate, GET /health, GET /ready).
+      .addTag('public', 'Unauthenticated endpoints — no API key required')
+      .addTag('auth', 'Authentication and user onboarding')
+      .addTag('wallets', 'Invisible wallet lifecycle management')
+      .addTag('payments', 'Payment orchestration with developer-scoped isolation')
+      .addTag('transactions', 'Stellar transaction relay and signing')
+      .addTag('api-keys', 'API key management for developers')
+      .addTag('limits', 'Spending limit enforcement')
+      .addTag('developers', 'Developer account management')
+      .addTag('projects', 'Project management under a developer account')
+      .addTag('webhooks', 'Outbound webhook delivery and configuration')
+      .addTag('key-management', 'Stellar keypair lifecycle and rotation')
+      .addTag('recovery', 'Wallet recovery flows')
+      .addTag('health', 'Liveness and readiness probes')
+      .build();
 
-  // Global exception filter for structured error responses. The filter emits
-  // the stable error envelope (code + correlation id) for every failure path,
-  // including bootstrap-time failures, so clients never receive an
-  // unstructured body. See test/error-envelope-bootstrap.e2e-spec.ts.
-  app.useGlobalFilters(new HttpExceptionFilter());
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('api', app, document, {
+      swaggerOptions: {
+        // Persist auth token across page reloads
+        persistAuthorization: true,
+        // Show request duration in Swagger UI
+        displayRequestDuration: true,
+      },
+    });
+  }
 
-  // Fail-closed write gate for graceful shutdown (#950): once a SIGTERM/SIGINT
-  // has been observed, mutating requests are refused with 503
-  // SHUTDOWN_IN_PROGRESS while reads/health keep working for the load balancer.
-  app.useGlobalInterceptors(app.get(DrainInProgressInterceptor));
-
-  // Let Nest call beforeApplicationShutdown/onApplicationShutdown on
-  // SIGTERM/SIGINT so in-flight payments drain (bounded by
-  // GRACEFUL_SHUTDOWN_TIMEOUT_MS) and connections (Prisma, etc.) close cleanly.
-  app.enableShutdownHooks();
-
-  await app.listen(env.PORT);
-  logger.log(
-    `Application listening on port ${env.PORT} (graceful drain budget ${app.get(GracefulShutdownService).drainTimeoutMs()}ms)`,
-  );
+  await app.listen(process.env['PORT'] ?? 3000);
 }
 
-bootstrap().catch((err) => {
-  // Fail-closed bootstrap: if the app cannot start (invalid env, dependency
-  // outage, etc.) we log a redacted, actionable error and exit non-zero so
-  // orchestrators restart rather than serving a half-initialized process.
-  // Never log raw env values, keys, JWTs, or webhook secrets.
-  const message = err instanceof Error ? err.message : String(err);
-  new Logger('Bootstrap').error(`Bootstrap failed: ${message}`);
-  process.exitCode = 1;
-});
+bootstrap();

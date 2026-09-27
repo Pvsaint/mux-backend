@@ -50,13 +50,23 @@ model Payment {
   receiverWalletId String?
   transactionId    String? @unique
 
-  /// Client-supplied idempotency key to prevent duplicate submissions
+  /// Client-supplied idempotency key to prevent duplicate submissions.
   idempotencyKey String? @unique
+
+  /// #972 — Developer that owns this payment (authz scope boundary).
+  /// Cross-developer enumeration is blocked at the query layer by filtering on this field.
+  developerOwnerId String?
+
+  /// Correlation ID for distributed tracing across services.
+  correlationId String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([idempotencyKey])
+  @@index([developerOwnerId])
+  @@index([developerOwnerId, id])
+  @@index([senderWalletId])
 }
 
 model UserLimit {
