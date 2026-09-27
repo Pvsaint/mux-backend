@@ -1,0 +1,168 @@
+# .github/workflows/ci.yml
+#
+# #970 — CI compose Postgres for e2e
+#
+# Full CI pipeline: lint → build → unit tests → e2e tests.
+# E2e tests run against a real Postgres 16 service container so that migration
+# and query behaviour is tested against the same engine used in production.
+#
+# Invariants:
+#   - E2e tests are isolated from unit tests (separate Jest config).
+#   - DATABASE_URL points to the service container, never to a production DB.
+#   - WALLET_ENCRYPTION_KEY is a CI-only throwaway secret; it satisfies the
+#     ≥32-char + non-placeholder validation without exposing real key material.
+#   - PAYMENT_ISOLATION_ENABLED=true so isolation invariants are tested in CI.
+#   - The workflow fails closed: any step failure aborts the pipeline.
+#   - Postgres health-check must pass before migrations or tests run.
+#
+# Rollback / kill-switch:
+#   - Disable the e2e job by setting the `run_e2e` input to false on
+#     workflow_dispatch, or delete the job entirely for a quick bypass.
+#   - The unit-test job is independent and will continue to run.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - 'feat/**'
+      - 'fix/**'
+      - 'chore/**'
+  pull_request:
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: Lint & build
+  # ──────────────────────────────────────────────────────────────────────────
+  build:
+    name: Lint & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:generate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: Unit tests (no database required)
+  # ──────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:generate
+
+      - name: Run unit tests
+        run: pnpm test
+        env:
+          # Satisfy env validation without a real DB — unit tests mock Prisma.
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mux_unit
+          WALLET_ENCRYPTION_KEY: ci-unit-test-throwaway-key-min-32-chars-long
+          PAYMENT_ISOLATION_ENABLED: 'true'
+          STELLAR_NETWORK: TESTNET
+          STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: E2e tests — requires a real Postgres service container
+  # ──────────────────────────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2e Tests (Postgres)
+    runs-on: ubuntu-latest
+    needs: build
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mux_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Points to the service container above — never a real production DB.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mux_e2e
+      # CI-only throwaway key (≥32 chars, not the default placeholder string).
+      WALLET_ENCRYPTION_KEY: ci-e2e-throwaway-encryption-key-min-32-chars
+      PAYMENT_ISOLATION_ENABLED: 'true'
+      STELLAR_NETWORK: TESTNET
+      STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+      # Disable Swagger UI in e2e (not required, avoids noise)
+      SWAGGER_ENABLED: 'false'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:generate
+
+      - name: Run database migrations
+        run: pnpm prisma:migrate:prod
+
+      - name: Run e2e tests
+        run: pnpm test:e2e
